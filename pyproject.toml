@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-speedkit"
+version = "0.1.0"
+description = "LLM inference benchmarking toolkit (single GPU)"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+  "typer>=0.9",
+  "transformers>=4.40",
+  "torch",
+]
+
+[project.scripts]
+llm-speedkit = "llm_speedkit.cli:main"
