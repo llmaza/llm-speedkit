@@ -278,15 +278,21 @@ class HFBackend(BackendBase):
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
-        gen_kwargs = dict(
-            max_new_tokens=cfg.gen_len,
-            do_sample=cfg.temperature > 0.0,
-            temperature=cfg.temperature,
-            top_p=cfg.top_p,
-            use_cache=True,
-            pad_token_id=tok.pad_token_id,
-            eos_token_id=tok.eos_token_id,
-        )
+            do_sample = cfg.temperature > 0.0
+
+            gen_kwargs = dict(
+                max_new_tokens=cfg.gen_len,
+                do_sample=do_sample,
+                use_cache=True,
+                pad_token_id=tok.pad_token_id,
+                eos_token_id=tok.eos_token_id,
+            )
+
+            # Only include sampling params when sampling is enabled
+            if do_sample:
+                gen_kwargs["temperature"] = cfg.temperature
+                gen_kwargs["top_p"] = cfg.top_p
+
 
         def do_generate() -> Dict[str, Any]:
             start = time.perf_counter()
