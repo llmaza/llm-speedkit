@@ -62,7 +62,7 @@ class InferConfig:
     # protocol
     warmup: int = 2
     runs: int = 5
-    seed: int = 42
+    seed: int = 28
 
     # output/logging
     outdir: str = "results"
@@ -70,6 +70,10 @@ class InferConfig:
     append: bool = True
     out_format: OutFmt = "csv"
     print_format: PrintFmt = "table"
+
+    # experiment tracking
+    run_id: Optional[str] = None
+    experiment_name: str = "infer_run_v1"
 
     # business
     gpu_cost_per_hour: Optional[float] = None
@@ -101,6 +105,16 @@ def _run_cmd(cmd: List[str]) -> str:
         return out.strip()
     except Exception:
         return ""
+
+def _pctl(xs: List[float], q: float) -> float:
+    if not xs:
+        return 0.0
+    xs = sorted(xs)
+    idx = int((len(xs) - 1) * q)
+    return float(xs[idx])
+
+def _make_run_id(prefix: str = "infer") -> str:
+    return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}"
 
 def ensure_outdir(outdir: str) -> Path:
     p = Path(outdir)
@@ -262,7 +276,11 @@ class HFBackend(BackendBase):
 
         load_sec = time.time() - t0
 
-        prompts = [cfg.prompt] * cfg.batch if cfg.prompt is not None else [("Hello " * max(1, cfg.prompt_len // 2))] * cfg.batch
+        prompts = (
+            [cfg.prompt] * cfg.batch
+            if cfg.prompt is not None
+            else [("Hello " * max(1, cfg.prompt_len // 2))] * cfg.batch
+        )
         inputs = tok(
             prompts,
             return_tensors="pt",
@@ -273,26 +291,23 @@ class HFBackend(BackendBase):
         if device == "cuda":
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
+        # define gen_kwargs for both cpu/cuda (prevents UnboundLocalError on CPU)
+        do_sample = cfg.temperature > 0.0
+        gen_kwargs: Dict[str, Any] = dict(
+            max_new_tokens=cfg.gen_len,
+            do_sample=do_sample,
+            use_cache=True,
+            pad_token_id=tok.pad_token_id,
+            eos_token_id=tok.eos_token_id,
+        )
+        if do_sample:
+            gen_kwargs["temperature"] = cfg.temperature
+            gen_kwargs["top_p"] = cfg.top_p
+
         peak_vram_mb = None
         if device == "cuda":
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-
-            do_sample = cfg.temperature > 0.0
-
-            gen_kwargs = dict(
-                max_new_tokens=cfg.gen_len,
-                do_sample=do_sample,
-                use_cache=True,
-                pad_token_id=tok.pad_token_id,
-                eos_token_id=tok.eos_token_id,
-            )
-
-            # Only include sampling params when sampling is enabled
-            if do_sample:
-                gen_kwargs["temperature"] = cfg.temperature
-                gen_kwargs["top_p"] = cfg.top_p
-
 
         def do_generate() -> Dict[str, Any]:
             start = time.perf_counter()
@@ -331,14 +346,20 @@ class HFBackend(BackendBase):
         if meas:
             avg_latency = sum(x["latency_sec"] for x in meas) / len(meas)
             avg_tps = sum(x["tokens_per_sec"] for x in meas) / len(meas)
+            latencies = [x["latency_sec"] for x in meas]
+            p50 = _pctl(latencies, 0.50)
+            p95 = _pctl(latencies, 0.95)
         else:
             avg_latency, avg_tps = 0.0, 0.0
+            p50, p95 = 0.0, 0.0
 
         return {
             "status": status,
             "error": err,
             "load_sec": round(load_sec, 6),
             "avg_latency_sec": round(avg_latency, 6),
+            "latency_p50_sec": round(p50, 6),
+            "latency_p95_sec": round(p95, 6),
             "tokens_per_sec": round(avg_tps, 6),
             "peak_vram_mb": peak_vram_mb,
         }
@@ -396,6 +417,8 @@ class VLLMBackend(BackendBase):
 
         avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
         avg_tps = sum(tps_list) / len(tps_list) if tps_list else 0.0
+        p50 = _pctl(latencies, 0.50) if latencies else 0.0
+        p95 = _pctl(latencies, 0.95) if latencies else 0.0
 
         # Peak VRAM: not trivial in vLLM without NVML; leave None for v0.1
         return {
@@ -403,6 +426,8 @@ class VLLMBackend(BackendBase):
             "error": err,
             "load_sec": round(load_sec, 6),
             "avg_latency_sec": round(avg_latency, 6),
+            "latency_p50_sec": round(p50, 6),
+            "latency_p95_sec": round(p95, 6),
             "tokens_per_sec": round(avg_tps, 6),
             "peak_vram_mb": None,
         }
@@ -421,8 +446,11 @@ def get_backend(name: BackendName) -> BackendBase:
 def _write_row(cfg: InferConfig, env: Dict[str, Any], result: Dict[str, Any], elapsed: float) -> Dict[str, Any]:
     cost_per_1m = compute_cost_per_1m(float(result.get("tokens_per_sec") or 0.0), cfg.gpu_cost_per_hour)
     now_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    run_id = cfg.run_id or _make_run_id("infer")
     return {
         "ts_utc": now_utc,
+        "run_id": run_id,
+        "experiment_name": cfg.experiment_name,
         "name": cfg.name or "",
         "domain": "infer",
         "action": "run",
@@ -442,6 +470,8 @@ def _write_row(cfg: InferConfig, env: Dict[str, Any], result: Dict[str, Any], el
         "error": result.get("error", ""),
         "load_sec": result.get("load_sec"),
         "avg_latency_sec": result.get("avg_latency_sec"),
+        "latency_p50_sec": result.get("latency_p50_sec"),
+        "latency_p95_sec": result.get("latency_p95_sec"),
         "tokens_per_sec": result.get("tokens_per_sec"),
         "peak_vram_mb": result.get("peak_vram_mb"),
         "wall_sec": round(elapsed, 6),
@@ -490,9 +520,13 @@ def _print_row(cfg: InferConfig, row: Dict[str, Any], outpath: Path) -> None:
         "gen_len",
         "tokens_per_sec",
         "avg_latency_sec",
+        "latency_p50_sec",
+        "latency_p95_sec",
         "peak_vram_mb",
         "cost_per_1m_tokens",
         "gpu_name",
+        "run_id",
+        "experiment_name",
     ]
     typer.echo(human_table(row, keys))
     typer.echo(f"Saved: {outpath}")
@@ -513,7 +547,8 @@ def write_report_md(report_path: Path, cfg_base: InferConfig, env: Dict[str, Any
 
     cols = [
         "status", "backend", "model", "dtype", "batch", "prompt_len", "gen_len",
-        "tokens_per_sec", "avg_latency_sec", "peak_vram_mb", "cost_per_1m_tokens", "gpu_name",
+        "tokens_per_sec", "avg_latency_sec", "latency_p50_sec", "latency_p95_sec",
+        "peak_vram_mb", "cost_per_1m_tokens", "gpu_name", "run_id", "experiment_name",
     ]
 
     now = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
@@ -542,8 +577,8 @@ def write_report_md(report_path: Path, cfg_base: InferConfig, env: Dict[str, Any
         for r in ok_sorted[:top_k]:
             lines.append(
                 f"- **tps={r.get('tokens_per_sec')}** | dtype={r.get('dtype')} | batch={r.get('batch')} "
-                f"| lat={r.get('avg_latency_sec')}s | peak_vram={r.get('peak_vram_mb')}MB "
-                f"| cost/1M={r.get('cost_per_1m_tokens')}"
+                f"| lat(avg)={r.get('avg_latency_sec')}s | p95={r.get('latency_p95_sec')}s "
+                f"| peak_vram={r.get('peak_vram_mb')}MB | cost/1M={r.get('cost_per_1m_tokens')}"
             )
     else:
         lines.append("- No successful runs (all OOM/errors).")
@@ -577,14 +612,18 @@ def write_best_json(best_path: Path, rows: List[Dict[str, Any]]) -> Optional[Dic
         "warmup": best.get("warmup"),
         "runs": best.get("runs"),
         "seed": best.get("seed"),
+        "experiment_name": best.get("experiment_name"),
+        "run_id": best.get("run_id"),
         "vllm_tp": best.get("vllm_tp", 1),
         "vllm_max_model_len": best.get("vllm_max_model_len", None),
         "vllm_gpu_mem_util": best.get("vllm_gpu_mem_util", None),
         "vllm_enforce_eager": bool(int(best.get("vllm_enforce_eager", 0))) if best.get("vllm_enforce_eager") is not None else None,
         "vllm_swap_space_gb": best.get("vllm_swap_space_gb", None),
-        # metrics snapshot (nice to keep)
+        # metrics snapshot
         "tokens_per_sec": best.get("tokens_per_sec"),
         "avg_latency_sec": best.get("avg_latency_sec"),
+        "latency_p50_sec": best.get("latency_p50_sec"),
+        "latency_p95_sec": best.get("latency_p95_sec"),
         "peak_vram_mb": best.get("peak_vram_mb"),
         "cost_per_1m_tokens": best.get("cost_per_1m_tokens"),
         "gpu_name": best.get("gpu_name"),
@@ -620,6 +659,8 @@ def infer_run(
     seed: Optional[int] = typer.Option(None, help="Seed."),
     outdir: Optional[str] = typer.Option(None, help="Output directory."),
     name: Optional[str] = typer.Option(None, help="Optional run tag/name."),
+    run_id: Optional[str] = typer.Option(None, help="Optional run_id (otherwise auto-generated)."),
+    experiment_name: Optional[str] = typer.Option(None, help="Experiment name for grouping runs."),
     append: Optional[bool] = typer.Option(None, help="Append to results file."),
     out_format: Optional[OutFmt] = typer.Option(None, help="Output format: csv|jsonl"),
     print_format: Optional[PrintFmt] = typer.Option(None, help="Print format: table|json"),
@@ -656,6 +697,8 @@ def infer_run(
             "seed": seed,
             "outdir": outdir,
             "name": name,
+            "run_id": run_id,
+            "experiment_name": experiment_name,
             "append": append,
             "out_format": out_format,
             "print_format": print_format,
@@ -714,6 +757,8 @@ def infer_sweep(
     seed: Optional[int] = typer.Option(None, help="Seed."),
     outdir: Optional[str] = typer.Option(None, help="Output directory."),
     name: Optional[str] = typer.Option(None, help="Optional name prefix for sweep rows."),
+    run_id: Optional[str] = typer.Option(None, help="Optional run_id (otherwise auto-generated)."),
+    experiment_name: Optional[str] = typer.Option(None, help="Experiment name for grouping runs."),
     append: Optional[bool] = typer.Option(None, help="Append to results file."),
     out_format: Optional[OutFmt] = typer.Option(None, help="Output format: csv|jsonl"),
     print_format: Optional[PrintFmt] = typer.Option(None, help="Print format: table|json"),
@@ -755,6 +800,8 @@ def infer_sweep(
             "seed": seed,
             "outdir": outdir,
             "name": name,
+            "run_id": run_id,
+            "experiment_name": experiment_name,
             "append": append,
             "out_format": out_format,
             "print_format": print_format,
@@ -778,7 +825,7 @@ def infer_sweep(
         for b in batch_list:
             cfg = replace(
                 base,
-                dtype=dt,
+                dtype=dt,  # type: ignore[arg-type]
                 batch=b,
                 name=(f"{base.name}_{dt}_b{b}" if base.name else f"{dt}_b{b}"),
             )
@@ -794,6 +841,8 @@ def infer_sweep(
                     "error": str(e),
                     "load_sec": None,
                     "avg_latency_sec": None,
+                    "latency_p50_sec": None,
+                    "latency_p95_sec": None,
                     "tokens_per_sec": None,
                     "peak_vram_mb": None,
                 }
@@ -816,8 +865,8 @@ def infer_sweep(
         for r in ok_rows[:5]:
             typer.echo(
                 f"- dtype={r.get('dtype')}, batch={r.get('batch')}, tps={r.get('tokens_per_sec')}, "
-                f"lat={r.get('avg_latency_sec')}s, peak_vram_mb={r.get('peak_vram_mb')}, "
-                f"cost/1M={r.get('cost_per_1m_tokens')}"
+                f"lat(avg)={r.get('avg_latency_sec')}s, p95={r.get('latency_p95_sec')}s, "
+                f"peak_vram_mb={r.get('peak_vram_mb')}, cost/1M={r.get('cost_per_1m_tokens')}"
             )
     else:
         typer.echo("\nNo successful runs recorded (all OOM/errors).")
