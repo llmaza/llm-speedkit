@@ -1,6 +1,6 @@
 # Changelog
 
-This project follows milestone-style releases aligned to the 8-week roadmap.
+This project follows milestone-style releases aligned to the 8-week roadmap.  
 Tags look like: `v0.x-weekY-short-name`.
 
 ## Unreleased
@@ -9,52 +9,61 @@ Tags look like: `v0.x-weekY-short-name`.
 ---
 
 ## v0.1-week1-bench-kv
-**Focus:** Benchmark foundation + KV-cache analysis
+**Focus:** Benchmark foundation + KV-cache analysis (single GPU)
 
 ### Added
-- `infer bench` (HF-only v0.1): TTFT, decode_tps, p50/p95 latency, peak VRAM logging
-- Advanced benchmark CSV schema (run_id, experiment_name, env metadata, status=ok/oom/error)
-- `infer kv estimate`: analytical KV-cache memory estimator (by seq_len / dtype / batch / model params)
-- `infer kv sweep`: empirical VRAM sweep with `use_cache` on/off
+- **Run tracking + schema**
+  - `run_id` + `experiment_name` added to inference runs
+  - Latency percentiles added: `latency_p50_sec`, `latency_p95_sec`
+- **Strict GPU placement (HF)**
+  - HF backend loads model on GPU without CPU offload (no `device_map="auto"`)
+- **Bench foundation (HF-only)**
+  - `infer bench run`: TTFT (`ttft_ms`), decode throughput (`decode_tps`), p50/p95 latency (ms), `peak_vram_mb`
+  - `infer bench smoke`: writes 1 schema row to validate `infer_bench_runs.csv`
+  - Advanced bench CSV: `results/infer_bench_runs.csv` (run metadata + env snapshot + status)
+- **KV-cache tools**
+  - `infer kv estimate`: analytical KV estimator (seq_len / dtype / batch / concurrency / beams)
+  - `infer kv sweep`: empirical KV sweep (measured vs estimated), outputs `results/kv_sweep.csv`
+  - `infer kv capacity`: KV headroom / max concurrency calculator, outputs `results/kv_capacity.csv`
+  - `--auto` for KV commands: infer `(num_layers, num_kv_heads, head_dim)` from HF model config
 
 ### Changed
-- Default seed set to 28
-- More consistent run metadata recorded per row
+- Default seed set to **28** (reproducibility)
+- Codebase refactor: split into modules (`core/`, `backends/`, `bench/`, `kv/`) to keep `cli.py` thin
 
 ### Notes
-- TTFT/prefill/decode split is a practical measurement (see `docs/methodology.md`)
-- VRAM peak depends on backend/allocator; use as relative comparison
+- `peak_vram_mb` is allocator-dependent; treat it as a relative signal, not an absolute truth.
+- KV memory scales linearly with `seq_len` and effective batch (`batch * concurrency * beams`).
+- Empirical KV sweep uses forward-pass peak delta (`use_cache=True` vs `False`) for stability.
 
 ---
 
 ## v0.2-week2-prefill-decode
 **Focus:** Prefill vs decode separation + sweet-spot sweeps (RTX 3080 10GB)
 
-### Added
+### Planned
 - Practical prefill vs decode timing split (documented methodology)
-- Sweep runner presets for prompt_len / gen_len / batch / dtype
+- Sweep presets: prompt_len / gen_len / batch / dtype
 - Baseline charts: TTFT vs prompt_len, VRAM vs prompt_len, decode_tps vs batch
-
-### Notes
-- Results summarized in `docs/results_week1.md` / `docs/results_week2.md` (if you add it)
+- Results summary in `docs/results_week2.md`
 
 ---
 
 ## v0.3-week3-attn-backends
 **Focus:** Attention backend tuning + behavior
 
-### Added
+### Planned
 - Attention backend comparison: `auto` vs `sdpa` vs `flash2` (when supported)
-- Fallback detection/recording notes (if backend silently falls back)
+- Fallback detection notes (when backend silently falls back)
 
 ---
 
 ## v0.4-week4-quant-pareto
 **Focus:** Quantization shootout + Pareto trade-offs
 
-### Added
+### Planned
 - Quant modes comparison (none / 8bit / 4bit where stable)
-- Lightweight “quality proxy” harness (sanity checks, not academic eval)
+- Lightweight “quality proxy” harness
 - Pareto summaries: speed vs VRAM vs quality proxy
 
 ---
@@ -62,8 +71,8 @@ Tags look like: `v0.x-weekY-short-name`.
 ## v0.5-week5-profiling
 **Focus:** Torch profiler + bottleneck explanations
 
-### Added
-- `infer profile`: trace export (Chrome trace) with run metadata
+### Planned
+- `infer profile`: Chrome trace export with run metadata
 - Profiled scenarios: prefill-heavy, decode-heavy, low-latency
 
 ---
@@ -71,7 +80,7 @@ Tags look like: `v0.x-weekY-short-name`.
 ## v0.6-week6-triton-microkernels
 **Focus:** Triton microkernel benchmarking
 
-### Added
+### Planned
 - Triton microbench suite (vs PyTorch baseline)
 - Notes on when Triton wins/loses (overhead vs memory vs compute)
 
@@ -80,7 +89,7 @@ Tags look like: `v0.x-weekY-short-name`.
 ## v0.7-week7-capacity-planner
 **Focus:** SLA/RPS/cost planning from benchmark CSVs
 
-### Added
+### Planned
 - `capacity plan`: workload presets + SLA target p95 + cost model
 - Scenario reports for chat / RAG / summarization presets
 
@@ -89,6 +98,6 @@ Tags look like: `v0.x-weekY-short-name`.
 ## v0.8-week8-specdec-feasibility
 **Focus:** Speculative decoding feasibility + final polish
 
-### Added
+### Planned
 - SpecDec simulation: speedup vs acceptance rate vs draft/target speed ratio
 - Final README polish + “what next on multi-GPU” section
