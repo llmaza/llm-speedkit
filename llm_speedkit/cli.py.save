@@ -1,46 +1,18 @@
+# llm_speedkit/cli.py
 from __future__ import annotations
 
+import csv
 import datetime as _dt
 import json
+import platform
+import subprocess
+import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import typer
-
-from llm_speedkit.core.env import collect_env
-from llm_speedkit.core.io import (
-    BENCH_CSV,
-    BenchRow,
-    append_bench_row,
-    append_csv,
-    append_jsonl,
-    ensure_outdir,
-)
-from llm_speedkit.core.stats import parse_csv_ints, parse_csv_strs
-
-from llm_speedkit.backends import get_backend
-from llm_speedkit.bench.hf_bench import run_hf_bench
-
-from llm_speedkit.core.config import (
-    InferConfig,
-    DEFAULT_MODEL,
-    DType,
-    BackendName,
-    DeviceName,
-    AttnName,
-    PrintFmt,
-    OutFmt,
-    OOMPolicy,
-    build_cfg_from_defaults_and_config,
-    apply_cli_overrides,
-)
-
-from llm_speedkit.kv.estimate import kv_estimate_to_csv
-from llm_speedkit.kv.sweep import run_kv_sweep_hf
-from llm_speedkit.kv.capacity import kv_capacity_to_csv
-
 
 # -----------------------------
 # App
@@ -49,26 +21,108 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 infer_app = typer.Typer(no_args_is_help=True)
 app.add_typer(infer_app, name="infer")
 
-bench_app = typer.Typer(no_args_is_help=True)
-infer_app.add_typer(bench_app, name="bench")
 
-kv_app = typer.Typer(no_args_is_help=True)
-infer_app.add_typer(kv_app, name="kv")
+# -----------------------------
+# Types / Defaults
+# -----------------------------
+DType = Literal["fp16", "bf16", "fp32"]
+BackendName = Literal["hf", "vllm"]
+DeviceName = Literal["cuda", "cpu"]
+AttnName = Literal["auto", "sdpa", "flash2"]
+PrintFmt = Literal["table", "json"]
+OutFmt = Literal["csv", "jsonl"]
+OOMPolicy = Literal["record", "error"]
+
+DEFAULT_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+
+# -----------------------------
+# Config
+# -----------------------------
+@dataclass(frozen=True)
+class InferConfig:
+    # model/backend
+    model: str = DEFAULT_MODEL
+    backend: BackendName = "hf"
+
+    # prompt/gen
+    prompt: Optional[str] = None
+    prompt_len: int = 128
+    gen_len: int = 256
+    temperature: float = 0.0
+    top_p: float = 1.0
+
+    # perf knobs
+    batch: int = 1
+    dtype: DType = "bf16"
+    device: DeviceName = "cuda"
+    compile: bool = False
+    attn: AttnName = "auto"
+
+    # protocol
+    warmup: int = 2
+    runs: int = 5
+    seed: int = 42
+
+    # output/logging
+    outdir: str = "results"
+    name: Optional[str] = None
+    append: bool = True
+    out_format: OutFmt = "csv"
+    print_format: PrintFmt = "table"
+
+    # business
+    gpu_cost_per_hour: Optional[float] = None
+    currency: str = "USD"
+
+    # failures
+    oom: OOMPolicy = "record"
+
+    # vLLM-only (ignored on HF)
+    vllm_tp: int = 1
+    vllm_max_model_len: Optional[int] = None
+    vllm_gpu_mem_util: float = 0.90
+    vllm_enforce_eager: bool = False
+    vllm_swap_space_gb: int = 0
 
 
 # -----------------------------
 # Small utilities
 # -----------------------------
-def _utc_ts() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def _parse_csv_ints(s: str) -> List[int]:
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
 
+def _parse_csv_strs(s: str) -> List[str]:
+    return [x.strip() for x in s.split(",") if x.strip()]
 
-def _make_run_id(prefix: str = "infer") -> str:
-    return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}"
+def _run_cmd(cmd: List[str]) -> str:
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return out.strip()
+    except Exception:
+        return ""
 
+def ensure_outdir(outdir: str) -> Path:
+    p = Path(outdir)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def append_csv(path: Path, row: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            w.writeheader()
+        w.writerow(row)
+
+def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 def human_table(row: Dict[str, Any], keys: List[str]) -> str:
-    pairs = [(k, "" if row.get(k) is None else str(row.get(k))) for k, _ in [(k, None) for k in keys]]
+    pairs = [(k, "" if row.get(k) is None else str(row.get(k))) for k in keys]
     c1 = max((len(k) for k, _ in pairs), default=0)
     c2 = max((len(v) for _, v in pairs), default=0)
     sep = "+" + "-" * (c1 + 2) + "+" + "-" * (c2 + 2) + "+"
@@ -78,6 +132,29 @@ def human_table(row: Dict[str, Any], keys: List[str]) -> str:
     lines.append(sep)
     return "\n".join(lines)
 
+def collect_env() -> Dict[str, Any]:
+    env: Dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "git_commit": _run_cmd(["git", "rev-parse", "HEAD"]),
+    }
+    try:
+        import torch
+        env["torch"] = torch.__version__
+        env["cuda_available"] = bool(torch.cuda.is_available())
+        env["cuda_version"] = getattr(torch.version, "cuda", None)
+        if torch.cuda.is_available():
+            env["gpu_name"] = torch.cuda.get_device_name(0)
+            props = torch.cuda.get_device_properties(0)
+            env["gpu_total_vram_mb"] = int(props.total_memory / (1024**2))
+    except Exception:
+        pass
+    try:
+        import transformers
+        env["transformers"] = transformers.__version__
+    except Exception:
+        pass
+    return env
 
 def compute_cost_per_1m(tokens_per_sec: float, gpu_cost_per_hour: Optional[float]) -> Optional[float]:
     if gpu_cost_per_hour is None:
@@ -88,13 +165,247 @@ def compute_cost_per_1m(tokens_per_sec: float, gpu_cost_per_hour: Optional[float
     return gpu_cost_per_hour / (tph / 1_000_000.0)
 
 
-def _validate_cfg_for_backend(cfg: InferConfig) -> None:
-    if cfg.backend in {"triton_openai", "triton_http", "triton_trtllm"}:
-        if not cfg.server_url:
-            raise typer.BadParameter(f"--server-url is required for backend={cfg.backend}")
+# -----------------------------
+# Config loading + "CLI wins"
+# -----------------------------
+def _infer_allowed_keys() -> set[str]:
+    return {f.name for f in fields(InferConfig)}
 
-    if cfg.backend == "triton_http" and not cfg.triton_model_name:
-        raise typer.BadParameter("--triton-model-name is required for backend=triton_http")
+def load_config_file(path: str) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        raise typer.BadParameter(f"--config file not found: {path}")
+    if p.suffix.lower() != ".json":
+        raise typer.BadParameter("--config currently supports only .json")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise typer.BadParameter(f"Failed to parse JSON config: {e}")
+    if not isinstance(data, dict):
+        raise typer.BadParameter("Config JSON must be an object/dict")
+    return data
+
+def build_cfg_from_defaults_and_config(config_path: Optional[str]) -> InferConfig:
+    base = InferConfig()
+    cfg_dict = dict(base.__dict__)
+    if config_path:
+        raw = load_config_file(config_path)
+        allowed = _infer_allowed_keys()
+        raw = {k: v for k, v in raw.items() if k in allowed}
+
+        # legacy alias
+        if "max_new_tokens" in raw and "gen_len" not in raw:
+            raw["gen_len"] = raw["max_new_tokens"]
+
+        cfg_dict.update(raw)
+    return InferConfig(**cfg_dict)
+
+def apply_cli_overrides(cfg: InferConfig, overrides: Dict[str, Any]) -> InferConfig:
+    # only keys explicitly passed by user (non-None) override config
+    clean = {k: v for k, v in overrides.items() if v is not None}
+    if not clean:
+        return cfg
+    merged = dict(cfg.__dict__)
+    merged.update(clean)
+    return InferConfig(**merged)
+
+
+# -----------------------------
+# Backend adapters
+# -----------------------------
+class BackendBase:
+    name: str
+    def run(self, cfg: InferConfig) -> Dict[str, Any]:
+        raise NotImplementedError
+
+class HFBackend(BackendBase):
+    name = "hf"
+
+    def run(self, cfg: InferConfig) -> Dict[str, Any]:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        if cfg.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but not available. Use --device cpu or fix torch/cuda.")
+
+        device = "cuda" if (cfg.device == "cuda" and torch.cuda.is_available()) else "cpu"
+
+        if cfg.dtype == "fp32":
+            torch_dtype = torch.float32
+        elif cfg.dtype == "bf16":
+            torch_dtype = torch.bfloat16
+            if device == "cuda" and not torch.cuda.is_bf16_supported():
+                torch_dtype = torch.float16
+        else:
+            torch_dtype = torch.float16
+
+        model_kwargs: Dict[str, Any] = {
+            "torch_dtype": torch_dtype,
+            "device_map": None if device == "cpu" else "auto",
+        }
+        if cfg.attn in ("sdpa", "flash2"):
+            model_kwargs["attn_implementation"] = cfg.attn
+
+        t0 = time.time()
+        tok = AutoTokenizer.from_pretrained(cfg.model, use_fast=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+
+        model = AutoModelForCausalLM.from_pretrained(cfg.model, **model_kwargs)
+        model.eval()
+
+        if cfg.compile and device == "cuda":
+            try:
+                model = torch.compile(model)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        load_sec = time.time() - t0
+
+        prompts = [cfg.prompt] * cfg.batch if cfg.prompt is not None else [("Hello " * max(1, cfg.prompt_len // 2))] * cfg.batch
+        inputs = tok(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max(8, cfg.prompt_len),
+        )
+        if device == "cuda":
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        peak_vram_mb = None
+        if device == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+        gen_kwargs = dict(
+            max_new_tokens=cfg.gen_len,
+            do_sample=cfg.temperature > 0.0,
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
+            use_cache=True,
+            pad_token_id=tok.pad_token_id,
+            eos_token_id=tok.eos_token_id,
+        )
+
+        def do_generate() -> Dict[str, Any]:
+            start = time.perf_counter()
+            with torch.inference_mode():
+                out = model.generate(**inputs, **gen_kwargs)
+            end = time.perf_counter()
+
+            prompt_tokens = int(inputs["input_ids"].shape[1])
+            total_tokens = int(out.shape[1])
+            new_tokens = max(0, total_tokens - prompt_tokens)
+            new_tokens_total = new_tokens * cfg.batch
+
+            latency = end - start
+            tps = (new_tokens_total / latency) if latency > 0 else 0.0
+            return {"latency_sec": latency, "tokens_per_sec": tps, "new_tokens_total": new_tokens_total}
+        status, err = "ok", ""
+        warm = []
+        meas = []
+        try:
+            for _ in range(max(0, cfg.warmup)):
+                warm.append(do_generate())
+            for _ in range(max(1, cfg.runs)):
+                meas.append(do_generate())
+        except torch.cuda.OutOfMemoryError as e:
+            status, err = "oom", str(e)
+            if cfg.oom == "error":
+                raise
+        except Exception as e:
+            status, err = "error", str(e)
+            raise
+        finally:
+            if device == "cuda":
+                peak_vram_mb = int(torch.cuda.max_memory_allocated() / (1024**2))
+
+        if meas:
+            avg_latency = sum(x["latency_sec"] for x in meas) / len(meas)
+            avg_tps = sum(x["tokens_per_sec"] for x in meas) / len(meas)
+        else:
+            avg_latency, avg_tps = 0.0, 0.0
+
+        return {
+            "status": status,
+            "error": err,
+            "load_sec": round(load_sec, 6),
+            "avg_latency_sec": round(avg_latency, 6),
+            "tokens_per_sec": round(avg_tps, 6),
+            "peak_vram_mb": peak_vram_mb,
+        }
+
+class VLLMBackend(BackendBase):
+    name = "vllm"
+
+    def run(self, cfg: InferConfig) -> Dict[str, Any]:
+        try:
+            from vllm import LLM, SamplingParams  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "vLLM backend selected but vllm is not installed. Install it (e.g. pip install vllm) and retry."
+            ) from e
+
+        t0 = time.time()
+        llm = LLM(
+            model=cfg.model,
+            tensor_parallel_size=cfg.vllm_tp,
+            max_model_len=cfg.vllm_max_model_len,
+            gpu_memory_utilization=cfg.vllm_gpu_mem_util,
+            enforce_eager=cfg.vllm_enforce_eager,
+            swap_space=cfg.vllm_swap_space_gb,
+        )
+        load_sec = time.time() - t0
+
+        prompts = [cfg.prompt] * cfg.batch if cfg.prompt is not None else [("Hello " * 64)] * cfg.batch
+        sp = SamplingParams(temperature=cfg.temperature, top_p=cfg.top_p, max_tokens=cfg.gen_len)
+
+        latencies: List[float] = []
+        tps_list: List[float] = []
+        status, err = "ok", ""
+        try:
+            for _ in range(max(0, cfg.warmup)):
+                _ = llm.generate(prompts, sp)
+
+            for _ in range(max(1, cfg.runs)):
+                start = time.perf_counter()
+                outs = llm.generate(prompts, sp)
+                end = time.perf_counter()
+                latency = end - start
+
+                new_tokens_total = 0
+                for o in outs:
+                    # take first candidate only
+                    if o.outputs:
+                        new_tokens_total += len(o.outputs[0].token_ids)
+                tps = (new_tokens_total / latency) if latency > 0 else 0.0
+
+                latencies.append(latency)
+                tps_list.append(tps)
+        except Exception as e:
+            status, err = "error", str(e)
+            raise
+
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+        avg_tps = sum(tps_list) / len(tps_list) if tps_list else 0.0
+
+        # Peak VRAM: not trivial in vLLM without NVML; leave None for v0.1
+        return {
+            "status": status,
+            "error": err,
+            "load_sec": round(load_sec, 6),
+            "avg_latency_sec": round(avg_latency, 6),
+            "tokens_per_sec": round(avg_tps, 6),
+            "peak_vram_mb": None,
+        }
+
+def get_backend(name: BackendName) -> BackendBase:
+    if name == "hf":
+        return HFBackend()
+    if name == "vllm":
+        return VLLMBackend()
+    raise ValueError(f"Unknown backend: {name}")
 
 
 # -----------------------------
@@ -102,11 +413,9 @@ def _validate_cfg_for_backend(cfg: InferConfig) -> None:
 # -----------------------------
 def _write_row(cfg: InferConfig, env: Dict[str, Any], result: Dict[str, Any], elapsed: float) -> Dict[str, Any]:
     cost_per_1m = compute_cost_per_1m(float(result.get("tokens_per_sec") or 0.0), cfg.gpu_cost_per_hour)
-    run_id = cfg.run_id or _make_run_id("infer_run")
+    now_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return {
-        "ts_utc": _utc_ts(),
-        "run_id": run_id,
-        "experiment_name": cfg.experiment_name,
+        "ts_utc": now_utc,
         "name": cfg.name or "",
         "domain": "infer",
         "action": "run",
@@ -126,8 +435,6 @@ def _write_row(cfg: InferConfig, env: Dict[str, Any], result: Dict[str, Any], el
         "error": result.get("error", ""),
         "load_sec": result.get("load_sec"),
         "avg_latency_sec": result.get("avg_latency_sec"),
-        "latency_p50_sec": result.get("latency_p50_sec"),
-        "latency_p95_sec": result.get("latency_p95_sec"),
         "tokens_per_sec": result.get("tokens_per_sec"),
         "peak_vram_mb": result.get("peak_vram_mb"),
         "wall_sec": round(elapsed, 6),
@@ -141,28 +448,18 @@ def _write_row(cfg: InferConfig, env: Dict[str, Any], result: Dict[str, Any], el
         "cuda_version": env.get("cuda_version", ""),
         "python": env.get("python", ""),
         "platform": env.get("platform", ""),
-        "git_commit": env.get("git_sha", ""),
-        # vLLM traceability
+        "git_commit": env.get("git_commit", ""),
+        # keep vLLM knobs for traceability (harmless on HF)
         "vllm_tp": cfg.vllm_tp,
         "vllm_max_model_len": cfg.vllm_max_model_len,
         "vllm_gpu_mem_util": cfg.vllm_gpu_mem_util,
         "vllm_enforce_eager": int(cfg.vllm_enforce_eager),
         "vllm_swap_space_gb": cfg.vllm_swap_space_gb,
-        # server / endpoint traceability
-        "server_url": cfg.server_url,
-        "endpoint_kind": cfg.endpoint_kind,
-        "request_timeout_sec": cfg.request_timeout_sec,
-        "api_key_present": int(bool(cfg.api_key)),
-        "max_concurrency": cfg.max_concurrency,
-        "triton_model_name": cfg.triton_model_name,
-        "triton_model_version": cfg.triton_model_version,
-        "trtllm_engine_dir": cfg.trtllm_engine_dir,
     }
-
 
 def _save_row(cfg: InferConfig, row: Dict[str, Any]) -> Path:
     outdir_p = ensure_outdir(cfg.outdir)
-    outpath = outdir_p / f"infer_runs.{'csv' if cfg.out_format == 'csv' else 'jsonl'}"
+    outpath = outdir_p / f"infer_runs.{ 'csv' if cfg.out_format == 'csv' else 'jsonl' }"
     if not cfg.append:
         outpath.unlink(missing_ok=True)
     if cfg.out_format == "csv":
@@ -170,7 +467,6 @@ def _save_row(cfg: InferConfig, row: Dict[str, Any]) -> Path:
     else:
         append_jsonl(outpath, row)
     return outpath
-
 
 def _print_row(cfg: InferConfig, row: Dict[str, Any], outpath: Path) -> None:
     if cfg.print_format == "json":
@@ -187,16 +483,9 @@ def _print_row(cfg: InferConfig, row: Dict[str, Any], outpath: Path) -> None:
         "gen_len",
         "tokens_per_sec",
         "avg_latency_sec",
-        "latency_p50_sec",
-        "latency_p95_sec",
         "peak_vram_mb",
-        "server_url",
-        "endpoint_kind",
-        "triton_model_name",
         "cost_per_1m_tokens",
         "gpu_name",
-        "run_id",
-        "experiment_name",
     ]
     typer.echo(human_table(row, keys))
     typer.echo(f"Saved: {outpath}")
@@ -209,7 +498,6 @@ def _md_escape(x: Any) -> str:
     s = "" if x is None else str(x)
     return s.replace("|", "\\|")
 
-
 def write_report_md(report_path: Path, cfg_base: InferConfig, env: Dict[str, Any], rows: List[Dict[str, Any]], top_k: int = 10) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -218,8 +506,7 @@ def write_report_md(report_path: Path, cfg_base: InferConfig, env: Dict[str, Any
 
     cols = [
         "status", "backend", "model", "dtype", "batch", "prompt_len", "gen_len",
-        "tokens_per_sec", "avg_latency_sec", "latency_p50_sec", "latency_p95_sec",
-        "peak_vram_mb", "cost_per_1m_tokens", "gpu_name", "run_id", "experiment_name",
+        "tokens_per_sec", "avg_latency_sec", "peak_vram_mb", "cost_per_1m_tokens", "gpu_name",
     ]
 
     now = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
@@ -227,8 +514,6 @@ def write_report_md(report_path: Path, cfg_base: InferConfig, env: Dict[str, Any
     lines += [f"# llm-speedkit report", "", f"- Generated: `{now}`", f"- Command: `infer sweep`", ""]
     lines += ["## Run context", ""]
     lines += [
-        f"- Run ID: `{cfg_base.run_id or ''}`",
-        f"- Experiment: `{cfg_base.experiment_name}`",
         f"- Model: `{cfg_base.model}`",
         f"- Backend: `{cfg_base.backend}`",
         f"- Device: `{cfg_base.device}`",
@@ -240,7 +525,7 @@ def write_report_md(report_path: Path, cfg_base: InferConfig, env: Dict[str, Any
         f"- GPU: `{env.get('gpu_name','')}` ({env.get('gpu_total_vram_mb','')} MB)",
         f"- Torch: `{env.get('torch','')}` | Transformers: `{env.get('transformers','')}` | CUDA: `{env.get('cuda_version','')}`",
         f"- Python: `{env.get('python','')}` | Platform: `{env.get('platform','')}`",
-        f"- Git commit: `{env.get('git_sha','')}`",
+        f"- Git commit: `{env.get('git_commit','')}`",
         "",
         "## Top configs",
         "",
@@ -250,8 +535,8 @@ def write_report_md(report_path: Path, cfg_base: InferConfig, env: Dict[str, Any
         for r in ok_sorted[:top_k]:
             lines.append(
                 f"- **tps={r.get('tokens_per_sec')}** | dtype={r.get('dtype')} | batch={r.get('batch')} "
-                f"| lat(avg)={r.get('avg_latency_sec')}s | p95={r.get('latency_p95_sec')}s "
-                f"| peak_vram={r.get('peak_vram_mb')}MB | cost/1M={r.get('cost_per_1m_tokens')}"
+                f"| lat={r.get('avg_latency_sec')}s | peak_vram={r.get('peak_vram_mb')}MB "
+                f"| cost/1M={r.get('cost_per_1m_tokens')}"
             )
     else:
         lines.append("- No successful runs (all OOM/errors).")
@@ -263,13 +548,13 @@ def write_report_md(report_path: Path, cfg_base: InferConfig, env: Dict[str, Any
 
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-
 def write_best_json(best_path: Path, rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     ok_rows = [r for r in rows if r.get("status") == "ok" and isinstance(r.get("tokens_per_sec"), (int, float))]
     if not ok_rows:
         return None
     best = max(ok_rows, key=lambda r: float(r["tokens_per_sec"]))
 
+    # stable, replayable set (compatible with --config)
     best_cfg = {
         "backend": best.get("backend"),
         "model": best.get("model"),
@@ -285,25 +570,14 @@ def write_best_json(best_path: Path, rows: List[Dict[str, Any]]) -> Optional[Dic
         "warmup": best.get("warmup"),
         "runs": best.get("runs"),
         "seed": best.get("seed"),
-        "experiment_name": best.get("experiment_name"),
-        "run_id": best.get("run_id"),
         "vllm_tp": best.get("vllm_tp", 1),
         "vllm_max_model_len": best.get("vllm_max_model_len", None),
         "vllm_gpu_mem_util": best.get("vllm_gpu_mem_util", None),
         "vllm_enforce_eager": bool(int(best.get("vllm_enforce_eager", 0))) if best.get("vllm_enforce_eager") is not None else None,
         "vllm_swap_space_gb": best.get("vllm_swap_space_gb", None),
-        "server_url": best.get("server_url"),
-        "endpoint_kind": best.get("endpoint_kind"),
-        "request_timeout_sec": best.get("request_timeout_sec"),
-        "max_concurrency": best.get("max_concurrency"),
-        "triton_model_name": best.get("triton_model_name"),
-        "triton_model_version": best.get("triton_model_version"),
-        "trtllm_engine_dir": best.get("trtllm_engine_dir"),
-        # metrics snapshot
+        # metrics snapshot (nice to keep)
         "tokens_per_sec": best.get("tokens_per_sec"),
         "avg_latency_sec": best.get("avg_latency_sec"),
-        "latency_p50_sec": best.get("latency_p50_sec"),
-        "latency_p95_sec": best.get("latency_p95_sec"),
         "peak_vram_mb": best.get("peak_vram_mb"),
         "cost_per_1m_tokens": best.get("cost_per_1m_tokens"),
         "gpu_name": best.get("gpu_name"),
@@ -317,104 +591,13 @@ def write_best_json(best_path: Path, rows: List[Dict[str, Any]]) -> Optional[Dic
 # -----------------------------
 # Commands
 # -----------------------------
-@bench_app.command("smoke")
-def bench_smoke(
-    run_id: Optional[str] = typer.Option(None, help="Optional run_id (otherwise auto-generated)."),
-    experiment_name: str = typer.Option("bench_schema_smoke_v1", help="Experiment name."),
-) -> None:
-    env = collect_env()
-    rid = run_id or _make_run_id("infer_bench_smoke")
-
-    row = BenchRow(
-        ts=_utc_ts(),
-        run_id=rid,
-        experiment_name=experiment_name,
-        model_id="SMOKE",
-        git_sha=env.get("git_sha"),
-
-        backend="hf",
-        attn="auto",
-        dtype="fp16",
-        use_cache=1,
-
-        prompt_len=128,
-        gen_len=32,
-        batch=1,
-
-        ttft_ms=None,
-        prefill_ms=None,
-        decode_ms=None,
-        decode_tps=None,
-
-        latency_p50_ms=None,
-        latency_p95_ms=None,
-        peak_vram_mb=None,
-
-        status="ok",
-        error=None,
-
-        gpu_name=env.get("gpu_name"),
-        driver=None,
-        cuda=env.get("cuda_version"),
-        torch=env.get("torch"),
-        transformers=env.get("transformers"),
-        vllm=None,
-        python=env.get("python"),
-        platform=env.get("platform"),
-    )
-    append_bench_row(row)
-    typer.echo(f"Wrote 1 smoke row -> {BENCH_CSV}")
-
-
-@bench_app.command("run")
-def bench_run(
-    model: str = typer.Option(DEFAULT_MODEL, help="HF model id or local path."),
-    prompt_len: int = typer.Option(128, help="Synthetic prompt length (approx)."),
-    gen_len: int = typer.Option(256, help="New tokens to generate."),
-    batch: int = typer.Option(1, help="Batch size."),
-    dtype: DType = typer.Option("bf16", help="Compute dtype."),
-    attn: AttnName = typer.Option("auto", help="Attention impl: auto|sdpa|flash2."),
-    use_cache: bool = typer.Option(True, help="Whether to use KV-cache during generation."),
-    warmup: int = typer.Option(2, help="Warmup runs."),
-    runs: int = typer.Option(5, help="Measured runs."),
-    run_id: Optional[str] = typer.Option(None, help="Session run_id (otherwise auto-generated)."),
-    experiment_name: str = typer.Option("infer_bench_v1", help="Experiment name."),
-) -> None:
-    res = run_hf_bench(
-        model=model,
-        prompt_len=prompt_len,
-        gen_len=gen_len,
-        batch=batch,
-        dtype=str(dtype),
-        attn=str(attn),
-        use_cache=use_cache,
-        warmup=warmup,
-        runs=runs,
-        run_id=run_id,
-        experiment_name=experiment_name,
-    )
-
-    if res.get("status") != "ok":
-        typer.echo(f"Bench failed: status={res.get('status')} run_id={res.get('run_id')}")
-        typer.echo(f"CSV: {res.get('csv')}")
-        raise typer.Exit(code=2)
-
-    typer.echo(
-        f"Bench done ✅ run_id={res['run_id']} rows={res['rows']} "
-        f"lat_p50={res['lat_p50_ms']:.2f}ms lat_p95={res['lat_p95_ms']:.2f}ms (across runs)"
-    )
-    typer.echo(f"Appended -> {res['csv']}")
-
-
 @infer_app.command("run")
 def infer_run(
     config: Optional[str] = typer.Option(None, help="Path to JSON config file (baseline). CLI flags override it."),
 
+    # If you pass these flags explicitly, they override config; otherwise config/defaults remain.
     model: Optional[str] = typer.Option(None, help="HF model id or local path."),
-    backend: Optional[BackendName] = typer.Option(
-        None,
-        help="Backend: hf|vllm|triton_openai|triton_http|trtllm|triton_trtllm.",
-    ),
+    backend: Optional[BackendName] = typer.Option(None, help="Backend: hf|vllm."),
     prompt: Optional[str] = typer.Option(None, help="Prompt text. If omitted, synthetic prompt is used."),
     prompt_len: Optional[int] = typer.Option(None, help="Synthetic prompt length (approx)."),
     gen_len: Optional[int] = typer.Option(None, help="New tokens to generate."),
@@ -430,8 +613,6 @@ def infer_run(
     seed: Optional[int] = typer.Option(None, help="Seed."),
     outdir: Optional[str] = typer.Option(None, help="Output directory."),
     name: Optional[str] = typer.Option(None, help="Optional run tag/name."),
-    run_id: Optional[str] = typer.Option(None, help="Optional run_id (otherwise auto-generated)."),
-    experiment_name: Optional[str] = typer.Option(None, help="Experiment name for grouping runs."),
     append: Optional[bool] = typer.Option(None, help="Append to results file."),
     out_format: Optional[OutFmt] = typer.Option(None, help="Output format: csv|jsonl"),
     print_format: Optional[PrintFmt] = typer.Option(None, help="Print format: table|json"),
@@ -439,21 +620,14 @@ def infer_run(
     currency: Optional[str] = typer.Option(None, help="Currency label."),
     oom: Optional[OOMPolicy] = typer.Option(None, help="OOM policy: record|error."),
 
+    # vLLM-only flags (ignored on HF)
     vllm_tp: Optional[int] = typer.Option(None, help="[vLLM] tensor parallel size."),
     vllm_max_model_len: Optional[int] = typer.Option(None, help="[vLLM] max model len."),
     vllm_gpu_mem_util: Optional[float] = typer.Option(None, help="[vLLM] gpu memory utilization."),
     vllm_enforce_eager: Optional[bool] = typer.Option(None, help="[vLLM] enforce eager."),
     vllm_swap_space_gb: Optional[int] = typer.Option(None, help="[vLLM] swap space in GB."),
-
-    server_url: Optional[str] = typer.Option(None, help="Server URL for remote/server backends."),
-    endpoint_kind: Optional[str] = typer.Option(None, help="Endpoint kind: openai|triton_http|triton_grpc|trtllm."),
-    request_timeout_sec: Optional[float] = typer.Option(None, help="Request timeout in seconds."),
-    api_key: Optional[str] = typer.Option(None, help="Optional bearer token / API key."),
-    max_concurrency: Optional[int] = typer.Option(None, help="Server-side max concurrency hint."),
-    triton_model_name: Optional[str] = typer.Option(None, help="[Triton] model name."),
-    triton_model_version: Optional[str] = typer.Option(None, help="[Triton] model version."),
-    trtllm_engine_dir: Optional[str] = typer.Option(None, help="[TRT-LLM] engine directory."),
 ):
+    # defaults < config < explicit CLI flags
     base = build_cfg_from_defaults_and_config(config)
     cfg = apply_cli_overrides(
         base,
@@ -475,8 +649,6 @@ def infer_run(
             "seed": seed,
             "outdir": outdir,
             "name": name,
-            "run_id": run_id,
-            "experiment_name": experiment_name,
             "append": append,
             "out_format": out_format,
             "print_format": print_format,
@@ -488,23 +660,8 @@ def infer_run(
             "vllm_gpu_mem_util": vllm_gpu_mem_util,
             "vllm_enforce_eager": vllm_enforce_eager,
             "vllm_swap_space_gb": vllm_swap_space_gb,
-            "server_url": server_url,
-            "endpoint_kind": endpoint_kind,
-            "request_timeout_sec": request_timeout_sec,
-            "api_key": api_key,
-            "max_concurrency": max_concurrency,
-            "triton_model_name": triton_model_name,
-            "triton_model_version": triton_model_version,
-            "trtllm_engine_dir": trtllm_engine_dir,
         },
     )
-
-    if cfg.run_id is None:
-        cfg = replace(cfg, run_id=_make_run_id("infer_run"))
-    if cfg.experiment_name == "infer_run_v1" and experiment_name is None:
-        cfg = replace(cfg, experiment_name="infer_run_v1")
-
-    _validate_cfg_for_backend(cfg)
 
     env = collect_env()
     backend_impl = get_backend(cfg.backend)
@@ -525,18 +682,18 @@ def infer_run(
 def infer_sweep(
     config: Optional[str] = typer.Option(None, help="Path to JSON config file (baseline). CLI flags override it."),
 
+    # sweep axes (not in InferConfig)
     batches: str = typer.Option("1,2,4,8,16", help="Comma-separated batch sizes to try."),
     dtypes: str = typer.Option("bf16,fp16", help="Comma-separated dtypes to try (e.g. bf16,fp16)."),
     stop_on_oom: bool = typer.Option(True, help="Stop increasing batch for a dtype after first OOM."),
 
+    # reporting
     report_md: str = typer.Option("results/report.md", help="Write Markdown report (set '' to disable)."),
     report_best_json: str = typer.Option("results/best.json", help="Write best config JSON (set '' to disable)."),
 
+    # Optional CLI overrides for base config (same idea: None means "not passed")
     model: Optional[str] = typer.Option(None, help="HF model id or local path."),
-    backend: Optional[BackendName] = typer.Option(
-        None,
-        help="Backend: hf|vllm|triton_openai|triton_http|trtllm|triton_trtllm.",
-    ),
+    backend: Optional[BackendName] = typer.Option(None, help="Backend: hf|vllm."),
     prompt: Optional[str] = typer.Option(None, help="Prompt text. If omitted, synthetic prompt is used."),
     prompt_len: Optional[int] = typer.Option(None, help="Synthetic prompt length (approx)."),
     gen_len: Optional[int] = typer.Option(None, help="New tokens to generate."),
@@ -550,8 +707,6 @@ def infer_sweep(
     seed: Optional[int] = typer.Option(None, help="Seed."),
     outdir: Optional[str] = typer.Option(None, help="Output directory."),
     name: Optional[str] = typer.Option(None, help="Optional name prefix for sweep rows."),
-    run_id: Optional[str] = typer.Option(None, help="Optional run_id (otherwise auto-generated)."),
-    experiment_name: Optional[str] = typer.Option(None, help="Experiment name for grouping runs."),
     append: Optional[bool] = typer.Option(None, help="Append to results file."),
     out_format: Optional[OutFmt] = typer.Option(None, help="Output format: csv|jsonl"),
     print_format: Optional[PrintFmt] = typer.Option(None, help="Print format: table|json"),
@@ -559,28 +714,21 @@ def infer_sweep(
     currency: Optional[str] = typer.Option(None, help="Currency label."),
     oom: Optional[OOMPolicy] = typer.Option(None, help="OOM policy: record|error."),
 
+    # vLLM-only flags (ignored on HF)
     vllm_tp: Optional[int] = typer.Option(None, help="[vLLM] tensor parallel size."),
     vllm_max_model_len: Optional[int] = typer.Option(None, help="[vLLM] max model len."),
     vllm_gpu_mem_util: Optional[float] = typer.Option(None, help="[vLLM] gpu memory utilization."),
     vllm_enforce_eager: Optional[bool] = typer.Option(None, help="[vLLM] enforce eager."),
     vllm_swap_space_gb: Optional[int] = typer.Option(None, help="[vLLM] swap space in GB."),
-
-    server_url: Optional[str] = typer.Option(None, help="Server URL for remote/server backends."),
-    endpoint_kind: Optional[str] = typer.Option(None, help="Endpoint kind: openai|triton_http|triton_grpc|trtllm."),
-    request_timeout_sec: Optional[float] = typer.Option(None, help="Request timeout in seconds."),
-    api_key: Optional[str] = typer.Option(None, help="Optional bearer token / API key."),
-    max_concurrency: Optional[int] = typer.Option(None, help="Server-side max concurrency hint."),
-    triton_model_name: Optional[str] = typer.Option(None, help="[Triton] model name."),
-    triton_model_version: Optional[str] = typer.Option(None, help="[Triton] model version."),
-    trtllm_engine_dir: Optional[str] = typer.Option(None, help="[TRT-LLM] engine directory."),
 ):
-    batch_list = parse_csv_ints(batches)
-    dtype_list = parse_csv_strs(dtypes)
+    batch_list = _parse_csv_ints(batches)
+    dtype_list = _parse_csv_strs(dtypes)
     if not batch_list:
         raise typer.BadParameter("--batches must contain at least one value.")
     if not dtype_list:
         raise typer.BadParameter("--dtypes must contain at least one value.")
 
+    # defaults < config < explicit CLI flags
     base0 = build_cfg_from_defaults_and_config(config)
     base = apply_cli_overrides(
         base0,
@@ -600,8 +748,6 @@ def infer_sweep(
             "seed": seed,
             "outdir": outdir,
             "name": name,
-            "run_id": run_id,
-            "experiment_name": experiment_name,
             "append": append,
             "out_format": out_format,
             "print_format": print_format,
@@ -613,23 +759,8 @@ def infer_sweep(
             "vllm_gpu_mem_util": vllm_gpu_mem_util,
             "vllm_enforce_eager": vllm_enforce_eager,
             "vllm_swap_space_gb": vllm_swap_space_gb,
-            "server_url": server_url,
-            "endpoint_kind": endpoint_kind,
-            "request_timeout_sec": request_timeout_sec,
-            "api_key": api_key,
-            "max_concurrency": max_concurrency,
-            "triton_model_name": triton_model_name,
-            "triton_model_version": triton_model_version,
-            "trtllm_engine_dir": trtllm_engine_dir,
         },
     )
-
-    if base.run_id is None:
-        base = replace(base, run_id=_make_run_id("infer_sweep"))
-    if base.experiment_name == "infer_run_v1" and experiment_name is None:
-        base = replace(base, experiment_name="infer_sweep_v1")
-
-    _validate_cfg_for_backend(base)
 
     env = collect_env()
     backend_impl = get_backend(base.backend)
@@ -640,7 +771,7 @@ def infer_sweep(
         for b in batch_list:
             cfg = replace(
                 base,
-                dtype=dt,  # type: ignore[arg-type]
+                dtype=dt,
                 batch=b,
                 name=(f"{base.name}_{dt}_b{b}" if base.name else f"{dt}_b{b}"),
             )
@@ -656,8 +787,6 @@ def infer_sweep(
                     "error": str(e),
                     "load_sec": None,
                     "avg_latency_sec": None,
-                    "latency_p50_sec": None,
-                    "latency_p95_sec": None,
                     "tokens_per_sec": None,
                     "peak_vram_mb": None,
                 }
@@ -680,8 +809,8 @@ def infer_sweep(
         for r in ok_rows[:5]:
             typer.echo(
                 f"- dtype={r.get('dtype')}, batch={r.get('batch')}, tps={r.get('tokens_per_sec')}, "
-                f"lat(avg)={r.get('avg_latency_sec')}s, p95={r.get('latency_p95_sec')}s, "
-                f"peak_vram_mb={r.get('peak_vram_mb')}, cost/1M={r.get('cost_per_1m_tokens')}"
+                f"lat={r.get('avg_latency_sec')}s, peak_vram_mb={r.get('peak_vram_mb')}, "
+                f"cost/1M={r.get('cost_per_1m_tokens')}"
             )
     else:
         typer.echo("\nNo successful runs recorded (all OOM/errors).")
@@ -701,140 +830,11 @@ def infer_sweep(
         raise typer.Exit(code=2)
 
 
-@kv_app.command("estimate")
-def kv_estimate(
-    model: str = typer.Option(DEFAULT_MODEL, help="HF model id or local path (used by --auto)."),
-    seq_len: int = typer.Option(..., "--seq-len", min=1),
-    batch: int = typer.Option(1, "--batch", min=1),
-    dtype: str = typer.Option("bf16", "--dtype"),
-    concurrency: int = typer.Option(1, "--concurrency", min=1),
-    beams: int = typer.Option(1, "--beams", min=1),
-
-    auto: bool = typer.Option(False, "--auto", help="Infer KV params from model config."),
-    num_layers: Optional[int] = typer.Option(None, "--num-layers", min=1),
-    num_kv_heads: Optional[int] = typer.Option(None, "--num-kv-heads", min=1),
-    head_dim: Optional[int] = typer.Option(None, "--head-dim", min=1),
-
-    run_id: Optional[str] = typer.Option(None, "--run-id"),
-    experiment_name: str = typer.Option("kv_estimate_v1", "--experiment-name"),
-) -> None:
-    res = kv_estimate_to_csv(
-        seq_len=seq_len,
-        batch=batch,
-        dtype=dtype,
-        concurrency=concurrency,
-        beams=beams,
-        num_layers=num_layers,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        auto=auto,
-        model_id=model,
-        run_id=run_id,
-        experiment_name=experiment_name,
-    )
-    row = res["row"]
-    typer.echo(
-        "\n".join(
-            [
-                "KV-cache estimate ✅",
-                f"  run_id: {row['run_id']}",
-                f"  experiment: {row['experiment_name']}",
-                f"  layers={row['num_layers']}, kv_heads={row['num_kv_heads']}, head_dim={row['head_dim']}",
-                f"  seq_len={row['seq_len']}, batch={row['batch']}, concurrency={row['concurrency']}, beams={row['beams']} -> effective_batch={row['effective_batch']}",
-                f"  dtype={row['dtype']} ({row['dtype_bytes']} bytes)",
-                f"  KV total: {row['kv_gb']} GB ({row['kv_mb']} MB)",
-                f"  +1 token cost: {row['kv_per_token_kb']} KB per token (effective_batch={row['effective_batch']})",
-                f"  appended: {res['csv']}",
-            ]
-        )
-    )
-
-
-@kv_app.command("sweep")
-def kv_sweep(
-    model: str = typer.Option(DEFAULT_MODEL, help="HF model id or local path."),
-    seq_lens: str = typer.Option("256,512,1024,2048", help="Comma-separated seq_lens (tokens)."),
-    batch: int = typer.Option(1, help="Batch size."),
-    dtype: str = typer.Option("bf16", help="fp16|bf16|fp32"),
-    attn: AttnName = typer.Option("auto", help="auto|sdpa|flash2"),
-    max_new_tokens: int = typer.Option(1, help="Generate this many tokens (keep small; 1 is enough)."),
-    num_layers: Optional[int] = typer.Option(None, "--num-layers", min=1),
-    num_kv_heads: Optional[int] = typer.Option(None, "--num-kv-heads", min=1),
-    head_dim: Optional[int] = typer.Option(None, "--head-dim", min=1),
-    run_id: Optional[str] = typer.Option(None, "--run-id"),
-    experiment_name: str = typer.Option("kv_sweep_v1", "--experiment-name"),
-    auto: bool = typer.Option(False, "--auto", help="Infer KV params from model config (layers/kv_heads/head_dim)."),
-) -> None:
-    lens = parse_csv_ints(seq_lens)
-    if not lens:
-        raise typer.BadParameter("--seq-lens must contain at least one integer.")
-
-    res = run_kv_sweep_hf(
-        model_id=model,
-        dtype=dtype,
-        attn=str(attn),
-        batch=batch,
-        seq_lens=lens,
-        max_new_tokens=max_new_tokens,
-        num_layers=num_layers,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        auto=auto,
-        run_id=run_id,
-        experiment_name=experiment_name,
-    )
-
-    typer.echo(f"KV sweep ✅ run_id={res['run_id']} rows={res['rows_written']}")
-    typer.echo(f"Appended -> {res['csv']}")
-
-
-@kv_app.command("capacity")
-def kv_capacity(
-    model: str = typer.Option(DEFAULT_MODEL, help="HF model id (used by --auto)."),
-    seq_len: int = typer.Option(..., "--seq-len", min=1),
-    dtype: str = typer.Option("bf16", "--dtype"),
-    batch: int = typer.Option(1, "--batch", min=1),
-    concurrency: int = typer.Option(1, "--concurrency", min=1),
-    beams: int = typer.Option(1, "--beams", min=1),
-    kv_budget_mb: Optional[float] = typer.Option(None, "--kv-budget-mb", help="If set, compute max concurrency for this KV budget."),
-    auto: bool = typer.Option(False, "--auto", help="Infer KV params from model config."),
-    num_layers: Optional[int] = typer.Option(None, "--num-layers", min=1),
-    num_kv_heads: Optional[int] = typer.Option(None, "--num-kv-heads", min=1),
-    head_dim: Optional[int] = typer.Option(None, "--head-dim", min=1),
-    run_id: Optional[str] = typer.Option(None, "--run-id"),
-    experiment_name: str = typer.Option("kv_capacity_v1", "--experiment-name"),
-) -> None:
-    res = kv_capacity_to_csv(
-        model_id=model,
-        dtype=dtype,
-        seq_len=seq_len,
-        batch=batch,
-        concurrency=concurrency,
-        beams=beams,
-        kv_budget_mb=kv_budget_mb,
-        auto=auto,
-        num_layers=num_layers,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        run_id=run_id,
-        experiment_name=experiment_name,
-    )
-    r = res["row"]
-    typer.echo("KV capacity ✅")
-    typer.echo(f"  model: {r['model_id']} dtype={r['dtype']} seq_len={r['seq_len']}")
-    typer.echo(f"  KV per request: {r['kv_mb_per_request']} MB  ({r['kv_kb_per_token_per_request']} KB/token)")
-    typer.echo(f"  current total KV (batch*conc*beams): {r['kv_mb_total']} MB")
-    if kv_budget_mb is not None:
-        typer.echo(f"  KV budget: {kv_budget_mb} MB -> max_concurrency ≈ {r['max_concurrency_for_budget']}")
-    typer.echo(f"  appended: {res['csv']}")
-
-
 # -----------------------------
 # Entrypoint
 # -----------------------------
 def main() -> None:
     app()
-
 
 if __name__ == "__main__":
     main()

@@ -135,7 +135,7 @@ def run_hf_bench(
 
         return {
             "ttft_ms": ttft * 1000.0,
-            "prefill_ms": None,
+            "prefill_ms": ttft * 1000.0,
             "decode_ms": decode * 1000.0,
             "decode_tps": float(decode_tps),
             "latency_ms": total_latency * 1000.0,
@@ -210,7 +210,7 @@ def run_hf_bench(
             gen_len=int(gen_len),
             batch=int(batch),
             ttft_ms=float(mres["ttft_ms"]),
-            prefill_ms=None,
+            prefill_ms=float(mres["prefill_ms"]),
             decode_ms=float(mres["decode_ms"]),
             decode_tps=float(mres["decode_tps"]),
             latency_p50_ms=float(p50),

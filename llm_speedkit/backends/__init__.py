@@ -1,15 +1,24 @@
 from __future__ import annotations
 
-from typing import Literal
-
 from .hf import HFBackend
 from .vllm import VLLMBackend
+from .triton_openai import TritonOpenAIBackend
+# from .triton_http import TritonHTTPBackend
+# from .trtllm import TRTLLMBackend
+# from .triton_trtllm import TritonTRTLLMBackend
 
-BackendName = Literal["hf", "vllm"]
+_BACKENDS = {
+    "hf": HFBackend,
+    "vllm": VLLMBackend,
+    "triton_openai": TritonOpenAIBackend,
+    # "triton_http": TritonHTTPBackend,
+    # "trtllm": TRTLLMBackend,
+    # "triton_trtllm": TritonTRTLLMBackend,
+}
 
-def get_backend(name: BackendName):
-    if name == "hf":
-        return HFBackend()
-    if name == "vllm":
-        return VLLMBackend()
-    raise ValueError(f"Unknown backend: {name}")
+def get_backend(name: str):
+    try:
+        return _BACKENDS[name]()
+    except KeyError as e:
+        available = ", ".join(sorted(_BACKENDS))
+        raise ValueError(f"Unknown backend: {name}. Available: {available}") from e

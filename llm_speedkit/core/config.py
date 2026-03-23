@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
 DType = Literal["fp16", "bf16", "fp32"]
-BackendName = Literal["hf", "vllm"]
+BackendName = Literal["hf", "vllm", "triton_http", "triton_openai", "trtllm", "triton_trtllm"]
 DeviceName = Literal["cuda", "cpu"]
 AttnName = Literal["auto", "sdpa", "flash2"]
 PrintFmt = Literal["table", "json"]
@@ -65,6 +65,24 @@ class InferConfig:
     vllm_gpu_mem_util: float = 0.90
     vllm_enforce_eager: bool = False
     vllm_swap_space_gb: int = 0
+
+    # server / endpoint
+    server_url: Optional[str] = None
+    endpoint_kind: Optional[str] = None # openai | triton_http | triton_grpc | trtllm
+    request_timeout_sec: float = 120.0
+
+    # auth / headers
+    api_key: Optional[str] = None
+
+    # server-side generation knobs
+    max_concurrency: Optional[int] = None
+
+    # triton-specific
+    triton_model_name: Optional[str] = None
+    triton_model_version: Optional[str] = None
+
+    # trtllm-specific
+    trtllm_engine_dir : Optional[str] = None
 
 
 def infer_allowed_keys() -> set[str]:

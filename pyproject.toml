@@ -16,3 +16,7 @@ dependencies = [
 
 [project.scripts]
 llm-speedkit = "llm_speedkit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["llm_speedkit*"]
+exclude = ["results*"]
