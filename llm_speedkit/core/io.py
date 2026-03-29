@@ -31,6 +31,8 @@ def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
 
 # ---- Bench schema (Part B) ----
 BENCH_CSV = Path("results") / "infer_bench_runs.csv"
+PROFILE_CSV = Path("results") / "infer_profile_runs.csv"
+PROFILE_DIR = Path("results") / "profile"
 
 BENCH_FIELDNAMES = [
     "ts", "run_id", "experiment_name", "model_id", "git_sha",
@@ -91,3 +93,66 @@ def append_bench_row(row: BenchRow, path: Path = BENCH_CSV) -> None:
         if write_header:
             w.writeheader()
         w.writerow({k: d.get(k) for k in BENCH_FIELDNAMES})
+
+
+PROFILE_FIELDNAMES = [
+    "ts", "run_id", "experiment_name", "model_id", "git_sha",
+    "backend", "attn", "dtype", "use_cache",
+    "prompt_len", "gen_len", "batch",
+    "status", "error",
+    "trace_path", "metadata_path", "scenario",
+    "profile_steps", "profiler_activities", "record_shapes", "with_stack",
+    "gpu_name", "driver", "cuda", "torch", "transformers", "vllm", "python", "platform",
+]
+
+
+@dataclass
+class ProfileRow:
+    ts: str
+    run_id: str
+    experiment_name: str
+    model_id: str
+    git_sha: Optional[str]
+
+    backend: str
+    attn: str
+    dtype: str
+    use_cache: int
+
+    prompt_len: int
+    gen_len: int
+    batch: int
+
+    status: str
+    error: Optional[str]
+
+    trace_path: Optional[str]
+    metadata_path: Optional[str]
+    scenario: Optional[str]
+
+    profile_steps: int
+    profiler_activities: str
+    record_shapes: int
+    with_stack: int
+
+    gpu_name: Optional[str]
+    driver: Optional[str]
+    cuda: Optional[str]
+    torch: Optional[str]
+    transformers: Optional[str]
+    vllm: Optional[str]
+    python: Optional[str]
+    platform: Optional[str]
+
+
+def append_profile_row(row: ProfileRow, path: Path = PROFILE_CSV) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    d = asdict(row)
+    for k in PROFILE_FIELDNAMES:
+        d.setdefault(k, None)
+    with path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=PROFILE_FIELDNAMES)
+        if write_header:
+            w.writeheader()
+        w.writerow({k: d.get(k) for k in PROFILE_FIELDNAMES})

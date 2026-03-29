@@ -4,7 +4,8 @@ This project follows milestone-style releases aligned to the 8-week roadmap.
 Tags look like: `v0.x-weekY-short-name`.
 
 ## Unreleased
-- (work in progress)
+- Added `infer profile` (HF-only v0.1) with torch profiler Chrome trace export
+- Added `results/infer_profile_runs.csv` plus per-run metadata sidecars under `results/profile/<run_id>/`
 
 ---
 

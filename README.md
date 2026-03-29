@@ -4,6 +4,7 @@
 SpeedKit is a single-GPU inference lab for **benchmarking + capacity reasoning**:
 - `infer run` / `infer sweep` for quick throughput + latency comparisons
 - `infer bench` for TTFT + decode TPS with a stable bench CSV schema
+- `infer profile` for torch profiler traces with trace metadata
 - `infer kv *` tools for **KV-cache memory estimation**, empirical validation, and concurrency budgeting
 
 Run everything via:
@@ -74,6 +75,56 @@ python -m llm_speedkit.cli infer bench run --runs 5 --warmup 2 --prompt-len 128 
 
 ---
 
+### `infer profile` — torch profiler trace export (HF-only v0.1)
+
+Profile runs write:
+
+* Chrome trace: `results/profile/<run_id>/trace.json`
+* Metadata sidecar: `results/profile/<run_id>/metadata.json`
+* Stable log row: `results/infer_profile_runs.csv`
+
+List preset scenarios:
+
+```bash
+python -m llm_speedkit.cli infer profile --list-scenarios
+```
+
+Preset intent:
+
+* `low_latency`: short prompt + short generation to reveal launch overhead, tokenizer/CPU cost, and small-batch latency.
+* `rag_long_prompt`: long prompt + short generation to reveal prefill-heavy attention and long-context behavior.
+* `decode_heavy`: short prompt + long generation to reveal autoregressive decode throughput and KV-cache reuse.
+
+Profile a preset:
+
+```bash
+python -m llm_speedkit.cli infer profile --scenario low_latency
+python -m llm_speedkit.cli infer profile --scenario rag_long_prompt --dtype bf16
+python -m llm_speedkit.cli infer profile --scenario decode_heavy --batch 1
+```
+
+Profile a custom configuration:
+
+```bash
+python -m llm_speedkit.cli infer profile \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --prompt-len 128 --gen-len 256 --batch 1 \
+  --dtype bf16 --warmup 1
+```
+
+Inspect the trace:
+
+* Open `chrome://tracing` in Chromium/Chrome and load `trace.json`
+* Or open the trace in Perfetto UI if you prefer that viewer
+
+Notes:
+
+* v0.1 profile support is `backend=hf` only.
+* Presets carry clean defaults for `backend`, `dtype`, `attn`, `prompt_len`, `gen_len`, and `batch`, but any of them can be overridden from the CLI.
+* The metadata JSON records model, backend, dtype, prompt/gen lengths, batch, run_id, experiment name, trace path, and env snapshot.
+
+---
+
 ### `infer kv` — KV-cache memory tools
 
 KV tools answer:
@@ -132,9 +183,11 @@ Local artifacts (typically gitignored):
 
 * `results/infer_runs.csv`
 * `results/infer_bench_runs.csv`
+* `results/infer_profile_runs.csv`
 * `results/kv_estimates.csv`
 * `results/kv_sweep.csv`
 * `results/kv_capacity.csv`
+* `results/profile/<run_id>/trace.json`, `results/profile/<run_id>/metadata.json`
 * `results/report.md`, `results/best.json`
 * `results/plots/*`
 

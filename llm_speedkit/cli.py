@@ -22,6 +22,12 @@ from llm_speedkit.core.stats import parse_csv_ints, parse_csv_strs
 
 from llm_speedkit.backends import get_backend
 from llm_speedkit.bench.hf_bench import run_hf_bench
+from llm_speedkit.bench.hf_profile import (
+    list_profile_scenarios,
+    run_hf_profile,
+    scenario_overrides,
+    scenario_use_cache,
+)
 
 from llm_speedkit.core.config import (
     InferConfig,
@@ -374,7 +380,7 @@ def bench_run(
     batch: int = typer.Option(1, help="Batch size."),
     dtype: DType = typer.Option("bf16", help="Compute dtype."),
     attn: AttnName = typer.Option("auto", help="Attention impl: auto|sdpa|flash2."),
-    use_cache: bool = typer.Option(True, help="Whether to use KV-cache during generation."),
+    use_cache: Optional[bool] = typer.Option(None, help="Whether to use KV-cache during generation."),
     warmup: int = typer.Option(2, help="Warmup runs."),
     runs: int = typer.Option(5, help="Measured runs."),
     run_id: Optional[str] = typer.Option(None, help="Session run_id (otherwise auto-generated)."),
@@ -403,6 +409,102 @@ def bench_run(
         f"Bench done ✅ run_id={res['run_id']} rows={res['rows']} "
         f"lat_p50={res['lat_p50_ms']:.2f}ms lat_p95={res['lat_p95_ms']:.2f}ms (across runs)"
     )
+    typer.echo(f"Appended -> {res['csv']}")
+
+
+@infer_app.command("profile")
+def infer_profile(
+    config: Optional[str] = typer.Option(None, help="Path to JSON config file (baseline). CLI flags override it."),
+    scenario: Optional[str] = typer.Option(None, help="Named profile scenario preset."),
+    list_scenarios: bool = typer.Option(False, "--list-scenarios", help="Print available profile scenarios and exit."),
+    model: Optional[str] = typer.Option(None, help="HF model id or local path."),
+    backend: Optional[BackendName] = typer.Option(None, help="Backend. v0.1 profiler supports hf only."),
+    prompt_len: Optional[int] = typer.Option(None, help="Synthetic prompt length (approx)."),
+    gen_len: Optional[int] = typer.Option(None, help="New tokens to generate."),
+    batch: Optional[int] = typer.Option(None, help="Batch size."),
+    dtype: Optional[DType] = typer.Option(None, help="Compute dtype."),
+    attn: Optional[AttnName] = typer.Option(None, help="Attention impl: auto|sdpa|flash2."),
+    warmup: Optional[int] = typer.Option(None, help="Warmup runs before profiling."),
+    outdir: Optional[str] = typer.Option(None, help="Output directory root."),
+    run_id: Optional[str] = typer.Option(None, help="Optional run_id (otherwise auto-generated)."),
+    experiment_name: Optional[str] = typer.Option(None, help="Experiment name for grouping runs."),
+    use_cache: Optional[bool] = typer.Option(None, help="Whether to use KV-cache during generation."),
+    record_shapes: bool = typer.Option(True, help="Enable profiler shape recording."),
+    with_stack: bool = typer.Option(False, help="Enable Python stack capture in the profiler."),
+) -> None:
+    if list_scenarios:
+        typer.echo(json.dumps(list_profile_scenarios(), ensure_ascii=False, indent=2))
+        return
+
+    base = build_cfg_from_defaults_and_config(config)
+    scenario_cfg = scenario_overrides(scenario)
+    base = apply_cli_overrides(base, scenario_cfg)
+    effective_use_cache = scenario_use_cache(scenario) if use_cache is None else use_cache
+    if effective_use_cache is None:
+        effective_use_cache = True
+    cfg = apply_cli_overrides(
+        base,
+        {
+            "model": model,
+            "backend": backend,
+            "prompt_len": prompt_len,
+            "gen_len": gen_len,
+            "batch": batch,
+            "dtype": dtype,
+            "attn": attn,
+            "warmup": warmup,
+            "outdir": outdir,
+            "run_id": run_id,
+            "experiment_name": experiment_name,
+        },
+    )
+
+    if cfg.run_id is None:
+        cfg = replace(cfg, run_id=_make_run_id("infer_profile"))
+    if cfg.experiment_name == "infer_run_v1" and experiment_name is None:
+        cfg = replace(cfg, experiment_name="infer_profile_v1")
+
+    if cfg.backend != "hf":
+        typer.echo("infer profile currently supports backend=hf only.")
+        raise typer.Exit(code=2)
+
+    try:
+        res = run_hf_profile(
+            model=cfg.model,
+            prompt_len=cfg.prompt_len,
+            gen_len=cfg.gen_len,
+            batch=cfg.batch,
+            dtype=str(cfg.dtype),
+            attn=str(cfg.attn),
+            use_cache=effective_use_cache,
+            warmup=cfg.warmup,
+            run_id=cfg.run_id,
+            experiment_name=cfg.experiment_name,
+            outdir=cfg.outdir,
+            scenario=scenario,
+            record_shapes=record_shapes,
+            with_stack=with_stack,
+        )
+    except ValueError as e:
+        typer.echo(f"Profile configuration error: {e}")
+        raise typer.Exit(code=2)
+    except Exception as e:
+        typer.echo(f"Profile failed before trace export: {e}")
+        raise typer.Exit(code=2)
+
+    if res.get("status") != "ok":
+        typer.echo(f"Profile failed: status={res.get('status')} run_id={res.get('run_id')}")
+        typer.echo(f"CSV: {res.get('csv')}")
+        if res.get("error"):
+            typer.echo(f"Error: {res.get('error')}")
+        raise typer.Exit(code=2)
+
+    typer.echo(
+        f"Profile done ✅ run_id={res['run_id']} scenario={res.get('scenario') or 'custom'} "
+        f"prompt_len={res['prompt_len']} gen_len={res['gen_len']} batch={res['batch']}"
+    )
+    typer.echo(f"Trace: {res['trace_path']}")
+    typer.echo(f"Metadata: {res['metadata_path']}")
     typer.echo(f"Appended -> {res['csv']}")
 
 
